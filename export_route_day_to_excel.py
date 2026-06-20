@@ -34,7 +34,13 @@ from(bucket:"{bucket}")
     r._field == "lat" or
     r._field == "lon"
   )
-  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> toFloat()
+  |> group(columns: [])
+  |> pivot(
+    rowKey: ["_time", "route_id", "stop_id", "trip_id", "vehicle_id"],
+    columnKey: ["_field"],
+    valueColumn: "_value"
+  )
   |> keep(columns: [
     "_time",
     "route_id",
@@ -45,6 +51,7 @@ from(bucket:"{bucket}")
     "lat",
     "lon"
   ])
+  |> sort(columns: ["_time"])
 '''
 
     cmd = [
@@ -88,32 +95,43 @@ def parse_influx_csv(csv_text: str) -> pd.DataFrame:
         low_memory=False,
     )
 
-    # Influx annotated CSV often gives us junk columns like result/table/unnamed index.
+    # Drop Influx metadata columns and blank columns.
     drop_cols = [
         col
         for col in df.columns
-        if col.startswith("Unnamed")
+        if str(col).startswith("Unnamed")
+        or col == ""
         or col in {"result", "table", "_start", "_stop", "_measurement"}
     ]
 
     df = df.drop(columns=drop_cols, errors="ignore")
 
+    # Remove accidental repeated header rows, just in case.
     if "_time" in df.columns:
-        # Parse as UTC first.
-        df["_time"] = pd.to_datetime(df["_time"], errors="coerce", utc=True)
+        df = df[df["_time"] != "_time"]
 
-        # Keep a clean timezone-free Excel version.
+    if "_time" in df.columns:
+        df["_time"] = pd.to_datetime(df["_time"], errors="coerce", utc=True)
         df["_time"] = df["_time"].dt.tz_convert("UTC").dt.tz_localize(None)
 
     for col in ["delay_seconds", "lat", "lon"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Add useful date/time columns.
+    for col in ["route_id", "stop_id", "trip_id", "vehicle_id"]:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+
     if "_time" in df.columns:
         df["service_date"] = df["_time"].dt.date
         df["hour"] = df["_time"].dt.hour
         df["weekday"] = df["_time"].dt.day_name()
+
+    if "lat" in df.columns:
+        df["lat_suspicious"] = df["lat"].notna() & ~df["lat"].between(35, 50)
+
+    if "lon" in df.columns:
+        df["lon_suspicious"] = df["lon"].notna() & ~df["lon"].between(-90, -70)
 
     return df
 
@@ -317,6 +335,18 @@ def main() -> None:
     )
 
     raw_df = parse_influx_csv(csv_text)
+
+    print("Columns after parsing:")
+    print(list(raw_df.columns))
+
+    if "_time" in raw_df.columns:
+        header_rows = raw_df[raw_df["_time"].astype(str).eq("_time")]
+        print(f"Repeated header rows remaining: {len(header_rows)}")
+
+    for col in ["lat", "lon", "delay_seconds"]:
+        if col in raw_df.columns:
+            print(f"{col} sample:")
+            print(raw_df[col].dropna().head(10).to_string(index=False))
 
     print(f"Rows returned: {len(raw_df):,}")
 
