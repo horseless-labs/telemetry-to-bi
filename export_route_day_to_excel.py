@@ -15,6 +15,14 @@ def require_env(name: str) -> str:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
+def clean_id_column(series: pd.Series) -> pd.Series:
+    return (
+        series
+        .astype("string")
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .replace({"<NA>": pd.NA, "nan": pd.NA, "NaN": pd.NA, "": pd.NA})
+    )
 
 def run_influx_query(
     container_name: str,
@@ -120,7 +128,7 @@ def parse_influx_csv(csv_text: str) -> pd.DataFrame:
 
     for col in ["route_id", "stop_id", "trip_id", "vehicle_id"]:
         if col in df.columns:
-            df[col] = df[col].astype("string")
+            df[col] = clean_id_column(df[col])
 
     if "_time" in df.columns:
         df["service_date"] = df["_time"].dt.date
@@ -133,6 +141,20 @@ def parse_influx_csv(csv_text: str) -> pd.DataFrame:
     if "lon" in df.columns:
         df["lon_suspicious"] = df["lon"].notna() & ~df["lon"].between(-90, -70)
 
+    has_lat_lon = (
+    df.get("lat", pd.Series(index=df.index, dtype="float")).notna()
+    & df.get("lon", pd.Series(index=df.index, dtype="float")).notna()
+)
+
+    has_stop_id = (
+        df.get("stop_id", pd.Series(index=df.index, dtype="string")).notna()
+    )
+
+    df["record_type"] = "unknown"
+    df.loc[has_lat_lon, "record_type"] = "vehicle_position"
+    df.loc[has_stop_id & ~has_lat_lon, "record_type"] = "stop_prediction"
+    df.loc[has_stop_id & has_lat_lon, "record_type"] = "stop_with_position"
+
     return df
 
 
@@ -141,6 +163,9 @@ def make_daily_route_summary(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     group_cols = ["service_date", "route_id"]
+
+    if "record_type" in df.columns:
+        group_cols.append("record_type")
 
     return (
         df.groupby(group_cols, dropna=False)
@@ -162,7 +187,12 @@ def make_hourly_route_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "delay_seconds" not in df.columns:
         return pd.DataFrame()
 
-    group_cols = ["service_date", "route_id", "hour"]
+    group_cols = ["service_date", "route_id"]
+
+    if "record_type" in df.columns:
+        group_cols.append("record_type")
+
+    group_cols.append("hour")
 
     return (
         df.groupby(group_cols, dropna=False)
@@ -182,6 +212,15 @@ def make_stop_summary(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     if df["stop_id"].isna().all():
+        return pd.DataFrame()
+
+    # Stop summary should only use stop-level rows.
+    if "record_type" in df.columns:
+        df = df[df["record_type"].isin(["stop_prediction", "stop_with_position"])].copy()
+    else:
+        df = df[df["stop_id"].notna()].copy()
+
+    if df.empty:
         return pd.DataFrame()
 
     group_cols = ["service_date", "route_id", "stop_id"]
