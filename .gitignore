@@ -2,3 +2,4 @@ wimbac-influx-copy/
 *.sw*
 __pycache__/*
 influx_token.txt
+*.txt
