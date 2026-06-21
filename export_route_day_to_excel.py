@@ -340,7 +340,9 @@ def main() -> None:
     )
 
     parser.add_argument("--route-id", required=True)
-    parser.add_argument("--date", required=True, help="Service date, e.g. 2026-05-04")
+    parser.add_argument("--date", default=None, help="Single service date, e.g. 2026-05-04")
+    parser.add_argument("--start-date", default=None, help="Start date inclusive, e.g. 2026-05-04")
+    parser.add_argument("--end-date", default=None, help="End date inclusive, e.g. 2026-05-10")
     parser.add_argument("--container", default="local-influx")
     parser.add_argument("--output", default=None)
 
@@ -350,15 +352,23 @@ def main() -> None:
     org = require_env("INFLUX_ORG")
     token = require_env("INFLUX_TOKEN")
 
-    start = f"{args.date}T00:00:00Z"
+    if args.date:
+        start_date = pd.to_datetime(args.date)
+        stop_date = start_date + pd.Timedelta(days=1)
+    elif args.start_date and args.end_date:
+        start_date = pd.to_datetime(args.start_date)
+        stop_date = pd.to_datetime(args.end_date) + pd.Timedelta(days=1)
+    else:
+        raise RuntimeError("Use either --date or both --start-date and --end-date")
 
-    # Simple next-day stop. Good enough for UTC-based first pass.
-    stop_date = (pd.to_datetime(args.date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    stop = f"{stop_date}T00:00:00Z"
+    start = start_date.strftime("%Y-%m-%dT00:00:00Z")
+    stop = stop_date.strftime("%Y-%m-%dT00:00:00Z")
+    
+    date_label = args.date or f"{args.start_date}_to_{args.end_date}"
 
     output_path = Path(
         args.output
-        or f"route_{args.route_id}_{args.date}_analytics.xlsx"
+        or f"route_{args.route_id}_{date_label}_analytics.xlsx"
     )
 
     print(f"Querying route {args.route_id} from {start} to {stop}...")
