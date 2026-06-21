@@ -7,6 +7,7 @@ from io import StringIO
 from pathlib import Path
 
 import pandas as pd
+from tqdm import tqdm
 
 
 def require_env(name: str) -> str:
@@ -14,6 +15,7 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
 
 def clean_id_column(series: pd.Series) -> pd.Series:
     return (
@@ -24,8 +26,8 @@ def clean_id_column(series: pd.Series) -> pd.Series:
         .replace({"<NA>": pd.NA, "nan": pd.NA, "NaN": pd.NA, "": pd.NA})
     )
 
+
 def run_influx_query(
-    container_name: str,
     bucket: str,
     org: str,
     token: str,
@@ -43,6 +45,7 @@ from(bucket:"{bucket}")
     r._field == "lon"
   )
   |> toFloat()
+  |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
   |> group(columns: [])
   |> pivot(
     rowKey: ["_time", "route_id", "stop_id", "trip_id", "vehicle_id"],
@@ -63,16 +66,13 @@ from(bucket:"{bucket}")
 '''
 
     cmd = [
-        "docker",
-        "exec",
-        "-e",
-        f"INFLUX_TOKEN={token}",
-        container_name,
         "influx",
         "query",
         flux_query,
         "--org",
         org,
+        "--token",
+        token,
         "--raw",
     ]
 
@@ -103,7 +103,6 @@ def parse_influx_csv(csv_text: str) -> pd.DataFrame:
         low_memory=False,
     )
 
-    # Drop Influx metadata columns and blank columns.
     drop_cols = [
         col
         for col in df.columns
@@ -114,11 +113,8 @@ def parse_influx_csv(csv_text: str) -> pd.DataFrame:
 
     df = df.drop(columns=drop_cols, errors="ignore")
 
-    # Remove accidental repeated header rows, just in case.
     if "_time" in df.columns:
         df = df[df["_time"] != "_time"]
-
-    if "_time" in df.columns:
         df["_time"] = pd.to_datetime(df["_time"], errors="coerce", utc=True)
         df["_time"] = df["_time"].dt.tz_convert("UTC").dt.tz_localize(None)
 
@@ -134,6 +130,13 @@ def parse_influx_csv(csv_text: str) -> pd.DataFrame:
         df["service_date"] = df["_time"].dt.date
         df["hour"] = df["_time"].dt.hour
         df["weekday"] = df["_time"].dt.day_name()
+        
+        df["operational_period"] = "Off-Peak"
+        is_peak_am = df["hour"].between(6, 8, inclusive="both")
+        is_peak_pm = df["hour"].between(15, 17, inclusive="both")
+        
+        df.loc[is_peak_am, "operational_period"] = "Peak AM"
+        df.loc[is_peak_pm, "operational_period"] = "Peak PM"
 
     if "lat" in df.columns:
         df["lat_suspicious"] = df["lat"].notna() & ~df["lat"].between(35, 50)
@@ -142,9 +145,9 @@ def parse_influx_csv(csv_text: str) -> pd.DataFrame:
         df["lon_suspicious"] = df["lon"].notna() & ~df["lon"].between(-90, -70)
 
     has_lat_lon = (
-    df.get("lat", pd.Series(index=df.index, dtype="float")).notna()
-    & df.get("lon", pd.Series(index=df.index, dtype="float")).notna()
-)
+        df.get("lat", pd.Series(index=df.index, dtype="float")).notna()
+        & df.get("lon", pd.Series(index=df.index, dtype="float")).notna()
+    )
 
     has_stop_id = (
         df.get("stop_id", pd.Series(index=df.index, dtype="string")).notna()
@@ -158,15 +161,7 @@ def parse_influx_csv(csv_text: str) -> pd.DataFrame:
     return df
 
 
-def make_daily_route_summary(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "delay_seconds" not in df.columns:
-        return pd.DataFrame()
-
-    group_cols = ["service_date", "route_id"]
-
-    if "record_type" in df.columns:
-        group_cols.append("record_type")
-
+def _aggregate_delay(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
     return (
         df.groupby(group_cols, dropna=False)
         .agg(
@@ -183,133 +178,96 @@ def make_daily_route_summary(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def make_hourly_route_summary(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "delay_seconds" not in df.columns:
-        return pd.DataFrame()
-
+def make_daily_route_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "delay_seconds" not in df.columns: return pd.DataFrame()
     group_cols = ["service_date", "route_id"]
+    if "record_type" in df.columns: group_cols.append("record_type")
+    return _aggregate_delay(df, group_cols)
 
-    if "record_type" in df.columns:
-        group_cols.append("record_type")
 
+def make_hourly_route_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "delay_seconds" not in df.columns: return pd.DataFrame()
+    group_cols = ["service_date", "route_id"]
+    if "record_type" in df.columns: group_cols.append("record_type")
     group_cols.append("hour")
+    return _aggregate_delay(df, group_cols)
 
-    return (
-        df.groupby(group_cols, dropna=False)
-        .agg(
-            num_points=("delay_seconds", "count"),
-            avg_delay_seconds=("delay_seconds", "mean"),
-            median_delay_seconds=("delay_seconds", "median"),
-            p90_delay_seconds=("delay_seconds", lambda s: s.quantile(0.90)),
-            max_delay_seconds=("delay_seconds", "max"),
-        )
-        .reset_index()
-    )
+
+def make_weekday_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "delay_seconds" not in df.columns or "weekday" not in df.columns:
+        return pd.DataFrame()
+    group_cols = ["route_id", "weekday"]
+    summary = _aggregate_delay(df, group_cols)
+    cats = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    summary['weekday'] = pd.Categorical(summary['weekday'], categories=cats, ordered=True)
+    return summary.sort_values('weekday')
+
+
+def make_operational_period_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "delay_seconds" not in df.columns or "operational_period" not in df.columns:
+        return pd.DataFrame()
+    group_cols = ["service_date", "route_id", "operational_period"]
+    return _aggregate_delay(df, group_cols)
 
 
 def make_stop_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "delay_seconds" not in df.columns or "stop_id" not in df.columns:
         return pd.DataFrame()
-
-    if df["stop_id"].isna().all():
-        return pd.DataFrame()
-
-    # Stop summary should only use stop-level rows.
+    if df["stop_id"].isna().all(): return pd.DataFrame()
     if "record_type" in df.columns:
         df = df[df["record_type"].isin(["stop_prediction", "stop_with_position"])].copy()
     else:
         df = df[df["stop_id"].notna()].copy()
-
-    if df.empty:
-        return pd.DataFrame()
-
+    if df.empty: return pd.DataFrame()
     group_cols = ["service_date", "route_id", "stop_id"]
-
-    return (
-        df.groupby(group_cols, dropna=False)
-        .agg(
-            num_points=("delay_seconds", "count"),
-            avg_delay_seconds=("delay_seconds", "mean"),
-            median_delay_seconds=("delay_seconds", "median"),
-            p90_delay_seconds=("delay_seconds", lambda s: s.quantile(0.90)),
-            max_delay_seconds=("delay_seconds", "max"),
-            pct_on_time=("delay_seconds", lambda s: s.between(-60, 300).mean()),
-            pct_late_5min=("delay_seconds", lambda s: (s > 300).mean()),
-            pct_late_10min=("delay_seconds", lambda s: (s > 600).mean()),
-        )
-        .reset_index()
-    )
+    return _aggregate_delay(df, group_cols)
 
 
-def write_excel(
+def write_outputs(
     output_path: Path,
     raw_df: pd.DataFrame,
     daily_summary: pd.DataFrame,
     hourly_summary: pd.DataFrame,
     stop_summary: pd.DataFrame,
+    weekday_summary: pd.DataFrame,
+    operational_summary: pd.DataFrame,
     metadata: dict,
 ) -> None:
-    MAX_EXCEL_ROWS = 1_048_576
-    RAW_SAMPLE_ROWS = 100_000
+    
+    # 1. ALWAYS write the raw dataframe to a CSV directly
+    raw_csv_path = output_path.with_name(f"{output_path.stem}_raw.csv")
+    raw_df.to_csv(raw_csv_path, index=False)
+    
+    metadata.update({
+        "raw_csv_output": str(raw_csv_path.resolve()),
+        "raw_rows_exported": len(raw_df),
+    })
 
-    raw_csv_path = None
-    raw_excel_limited = len(raw_df) > MAX_EXCEL_ROWS
-
-    if raw_excel_limited:
-        raw_csv_path = output_path.with_suffix(".raw.csv")
-        raw_df.to_csv(raw_csv_path, index=False)
-
-        raw_excel_df = raw_df.head(RAW_SAMPLE_ROWS).copy()
-        raw_sheet_name = "Raw Data Sample"
-
-        metadata = {
-            **metadata,
-            "raw_excel_limited": True,
-            "raw_rows_written_to_excel": len(raw_excel_df),
-            "raw_csv_output": str(raw_csv_path),
-        }
-    else:
-        raw_excel_df = raw_df
-        raw_sheet_name = "Raw Data"
-
-        metadata = {
-            **metadata,
-            "raw_excel_limited": False,
-            "raw_rows_written_to_excel": len(raw_excel_df),
-            "raw_csv_output": "",
-        }
-
+    # 2. Setup the Data Dictionary for the Excel Summary File
     data_dictionary = pd.DataFrame(
         [
             ["_time", "Timestamp of observation"],
             ["route_id", "Transit route identifier"],
             ["stop_id", "Stop identifier, if present"],
-            ["trip_id", "Trip identifier, if present"],
-            ["vehicle_id", "Vehicle identifier, if present"],
             ["delay_seconds", "Schedule delay in seconds"],
-            ["lat", "Latitude"],
-            ["lon", "Longitude"],
             ["service_date", "Date derived from _time"],
             ["hour", "Hour of day derived from _time"],
             ["weekday", "Weekday derived from _time"],
-            ["pct_on_time", "Share of records between -60 and 300 seconds delay"],
+            ["operational_period", "Peak AM (6-8), Peak PM (15-17), or Off-Peak"],
             ["pct_late_5min", "Share of records more than 5 minutes late"],
-            ["pct_late_10min", "Share of records more than 10 minutes late"],
         ],
         columns=["column", "description"],
     )
 
-    run_metadata = pd.DataFrame(
-        list(metadata.items()),
-        columns=["setting", "value"],
-    )
+    run_metadata = pd.DataFrame(list(metadata.items()), columns=["setting", "value"])
 
+    # 3. Write ONLY the summaries to Excel (Fixes the memory/hanging bug)
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        raw_excel_df.to_excel(writer, sheet_name=raw_sheet_name, index=False)
-
-        daily_summary.to_excel(writer, sheet_name="Daily Route Summary", index=False)
+        daily_summary.to_excel(writer, sheet_name="Daily Summary", index=False)
         hourly_summary.to_excel(writer, sheet_name="Hourly Summary", index=False)
-
+        weekday_summary.to_excel(writer, sheet_name="Weekday Summary", index=False)
+        operational_summary.to_excel(writer, sheet_name="Peak vs Off-Peak", index=False)
+        
         if not stop_summary.empty:
             stop_summary.to_excel(writer, sheet_name="Stop Summary", index=False)
 
@@ -317,23 +275,15 @@ def write_excel(
         run_metadata.to_excel(writer, sheet_name="Run Metadata", index=False)
 
         workbook = writer.book
-
-        header_format = workbook.add_format(
-            {
-                "bold": True,
-                "bg_color": "#D9EAF7",
-                "border": 1,
-            }
-        )
-
+        header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
         percent_format = workbook.add_format({"num_format": "0.0%"})
         seconds_format = workbook.add_format({"num_format": "0.0"})
-        datetime_format = workbook.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
 
         sheets_to_format = {
-            raw_sheet_name: raw_excel_df,
-            "Daily Route Summary": daily_summary,
+            "Daily Summary": daily_summary,
             "Hourly Summary": hourly_summary,
+            "Weekday Summary": weekday_summary,
+            "Peak vs Off-Peak": operational_summary,
             "Stop Summary": stop_summary,
             "Data Dictionary": data_dictionary,
             "Run Metadata": run_metadata,
@@ -348,43 +298,26 @@ def write_excel(
 
             for col_idx, col_name in enumerate(sheet_df.columns):
                 worksheet.write(0, col_idx, col_name, header_format)
-
                 width = max(
                     len(str(col_name)) + 2,
-                    min(
-                        28,
-                        int(sheet_df[col_name].astype(str).str.len().quantile(0.95)) + 2,
-                    )
-                    if not sheet_df.empty
-                    else 12,
+                    min(28, int(sheet_df[col_name].astype(str).str.len().quantile(0.95)) + 2) if not sheet_df.empty else 12,
                 )
-
                 worksheet.set_column(col_idx, col_idx, width)
 
-                if col_name == "_time":
-                    worksheet.set_column(col_idx, col_idx, 22, datetime_format)
-                elif str(col_name).startswith("pct_"):
+                if str(col_name).startswith("pct_"):
                     worksheet.set_column(col_idx, col_idx, 14, percent_format)
                 elif "delay_seconds" in str(col_name):
                     worksheet.set_column(col_idx, col_idx, 18, seconds_format)
+            
+            worksheet.autofilter(0, 0, len(sheet_df), max(0, len(sheet_df.columns) - 1))
 
-            worksheet.autofilter(
-                0,
-                0,
-                len(sheet_df),
-                max(0, len(sheet_df.columns) - 1),
-            )
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Export one route/day from local Docker InfluxDB to Excel."
-    )
-
+    parser = argparse.ArgumentParser(description="Export transit analytics pipeline.")
     parser.add_argument("--route-id", required=True)
-    parser.add_argument("--date", default=None, help="Single service date, e.g. 2026-05-04")
-    parser.add_argument("--start-date", default=None, help="Start date inclusive, e.g. 2026-05-04")
-    parser.add_argument("--end-date", default=None, help="End date inclusive, e.g. 2026-05-10")
-    parser.add_argument("--container", default="local-influx")
+    parser.add_argument("--date", default=None)
+    parser.add_argument("--start-date", default=None)
+    parser.add_argument("--end-date", default=None)
     parser.add_argument("--output", default=None)
 
     args = parser.parse_args()
@@ -405,72 +338,57 @@ def main() -> None:
     start = start_date.strftime("%Y-%m-%dT00:00:00Z")
     stop = stop_date.strftime("%Y-%m-%dT00:00:00Z")
 
-    date_label = args.date or f"{args.start_date}_to_{args.end_date}"
-
     export_dir = Path("exports") / args.route_id
     export_dir.mkdir(parents=True, exist_ok=True)
-
     date_label = args.date or f"{args.start_date}_to_{args.end_date}"
+    output_path = Path(args.output or export_dir / f"route_{args.route_id}_{date_label}_analytics.xlsx")
 
-    output_path = Path(
-        args.output
-        or export_dir / f"route_{args.route_id}_{date_label}_analytics.xlsx"
-    )
+    # Initialize Progress Bar
+    pipeline_steps = 5
+    with tqdm(total=pipeline_steps, desc="Pipeline Progress", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]") as pbar:
+        
+        pbar.set_postfix_str(f"Querying InfluxDB (Route {args.route_id})...")
+        csv_text = run_influx_query(bucket, org, token, args.route_id, start, stop)
+        pbar.update(1)
 
-    print(f"Querying route {args.route_id} from {start} to {stop}...")
+        pbar.set_postfix_str("Parsing raw CSV data...")
+        raw_df = parse_influx_csv(csv_text)
+        pbar.update(1)
 
-    csv_text = run_influx_query(
-        container_name=args.container,
-        bucket=bucket,
-        org=org,
-        token=token,
-        route_id=args.route_id,
-        start=start,
-        stop=stop,
-    )
+        pbar.set_postfix_str("Generating Dataframe summaries...")
+        daily_summary = make_daily_route_summary(raw_df)
+        hourly_summary = make_hourly_route_summary(raw_df)
+        stop_summary = make_stop_summary(raw_df)
+        weekday_summary = make_weekday_summary(raw_df)
+        operational_summary = make_operational_period_summary(raw_df)
+        pbar.update(1)
 
-    raw_df = parse_influx_csv(csv_text)
+        metadata = {
+            "bucket": bucket,
+            "org": org,
+            "route_id": args.route_id,
+            "start": start,
+            "stop": stop,
+            "summary_excel_output": str(output_path.resolve()),
+        }
 
-    print("Columns after parsing:")
-    print(list(raw_df.columns))
+        pbar.set_postfix_str("Writing CSV and Excel files to disk...")
+        write_outputs(
+            output_path=output_path,
+            raw_df=raw_df,
+            daily_summary=daily_summary,
+            hourly_summary=hourly_summary,
+            stop_summary=stop_summary,
+            weekday_summary=weekday_summary,
+            operational_summary=operational_summary,
+            metadata=metadata,
+        )
+        pbar.update(2) # Finish out the bar
 
-    if "_time" in raw_df.columns:
-        header_rows = raw_df[raw_df["_time"].astype(str).eq("_time")]
-        print(f"Repeated header rows remaining: {len(header_rows)}")
-
-    for col in ["lat", "lon", "delay_seconds"]:
-        if col in raw_df.columns:
-            print(f"{col} sample:")
-            print(raw_df[col].dropna().head(10).to_string(index=False))
-
-    print(f"Rows returned: {len(raw_df):,}")
-
-    daily_summary = make_daily_route_summary(raw_df)
-    hourly_summary = make_hourly_route_summary(raw_df)
-    stop_summary = make_stop_summary(raw_df)
-
-    metadata = {
-        "container": args.container,
-        "bucket": bucket,
-        "org": org,
-        "route_id": args.route_id,
-        "start": start,
-        "stop": stop,
-        "output": str(output_path),
-        "raw_rows": len(raw_df),
-    }
-
-    write_excel(
-        output_path=output_path,
-        raw_df=raw_df,
-        daily_summary=daily_summary,
-        hourly_summary=hourly_summary,
-        stop_summary=stop_summary,
-        metadata=metadata,
-    )
-
-    print(f"Excel export complete: {output_path}")
-
+    print(f"\n--- Export Complete ---")
+    print(f"Total Rows: {len(raw_df):,}")
+    print(f"Raw CSV location: {output_path.with_name(f'{output_path.stem}_raw.csv').resolve()}")
+    print(f"Summary Excel location: {output_path.resolve()}")
 
 if __name__ == "__main__":
     main()
