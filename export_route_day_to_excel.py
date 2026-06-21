@@ -249,6 +249,36 @@ def write_excel(
     stop_summary: pd.DataFrame,
     metadata: dict,
 ) -> None:
+    MAX_EXCEL_ROWS = 1_048_576
+    RAW_SAMPLE_ROWS = 100_000
+
+    raw_csv_path = None
+    raw_excel_limited = len(raw_df) > MAX_EXCEL_ROWS
+
+    if raw_excel_limited:
+        raw_csv_path = output_path.with_suffix(".raw.csv")
+        raw_df.to_csv(raw_csv_path, index=False)
+
+        raw_excel_df = raw_df.head(RAW_SAMPLE_ROWS).copy()
+        raw_sheet_name = "Raw Data Sample"
+
+        metadata = {
+            **metadata,
+            "raw_excel_limited": True,
+            "raw_rows_written_to_excel": len(raw_excel_df),
+            "raw_csv_output": str(raw_csv_path),
+        }
+    else:
+        raw_excel_df = raw_df
+        raw_sheet_name = "Raw Data"
+
+        metadata = {
+            **metadata,
+            "raw_excel_limited": False,
+            "raw_rows_written_to_excel": len(raw_excel_df),
+            "raw_csv_output": "",
+        }
+
     data_dictionary = pd.DataFrame(
         [
             ["_time", "Timestamp of observation"],
@@ -275,7 +305,8 @@ def write_excel(
     )
 
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        raw_df.to_excel(writer, sheet_name="Raw Data", index=False)
+        raw_excel_df.to_excel(writer, sheet_name=raw_sheet_name, index=False)
+
         daily_summary.to_excel(writer, sheet_name="Daily Route Summary", index=False)
         hourly_summary.to_excel(writer, sheet_name="Hourly Summary", index=False)
 
@@ -299,14 +330,16 @@ def write_excel(
         seconds_format = workbook.add_format({"num_format": "0.0"})
         datetime_format = workbook.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
 
-        for sheet_name, sheet_df in {
-            "Raw Data": raw_df,
+        sheets_to_format = {
+            raw_sheet_name: raw_excel_df,
             "Daily Route Summary": daily_summary,
             "Hourly Summary": hourly_summary,
             "Stop Summary": stop_summary,
             "Data Dictionary": data_dictionary,
             "Run Metadata": run_metadata,
-        }.items():
+        }
+
+        for sheet_name, sheet_df in sheets_to_format.items():
             if sheet_name not in writer.sheets or sheet_df.empty:
                 continue
 
@@ -318,21 +351,29 @@ def write_excel(
 
                 width = max(
                     len(str(col_name)) + 2,
-                    min(28, int(sheet_df[col_name].astype(str).str.len().quantile(0.95)) + 2)
+                    min(
+                        28,
+                        int(sheet_df[col_name].astype(str).str.len().quantile(0.95)) + 2,
+                    )
                     if not sheet_df.empty
                     else 12,
                 )
+
                 worksheet.set_column(col_idx, col_idx, width)
 
                 if col_name == "_time":
                     worksheet.set_column(col_idx, col_idx, 22, datetime_format)
-                elif col_name.startswith("pct_"):
+                elif str(col_name).startswith("pct_"):
                     worksheet.set_column(col_idx, col_idx, 14, percent_format)
-                elif "delay_seconds" in col_name:
+                elif "delay_seconds" in str(col_name):
                     worksheet.set_column(col_idx, col_idx, 18, seconds_format)
 
-            worksheet.autofilter(0, 0, len(sheet_df), max(0, len(sheet_df.columns) - 1))
-
+            worksheet.autofilter(
+                0,
+                0,
+                len(sheet_df),
+                max(0, len(sheet_df.columns) - 1),
+            )
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -363,7 +404,7 @@ def main() -> None:
 
     start = start_date.strftime("%Y-%m-%dT00:00:00Z")
     stop = stop_date.strftime("%Y-%m-%dT00:00:00Z")
-    
+
     date_label = args.date or f"{args.start_date}_to_{args.end_date}"
 
     output_path = Path(

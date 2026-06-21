@@ -3,4 +3,4 @@ wimbac-influx-copy/
 __pycache__/*
 influx_token.txt
 *.txt
-*.xlsx*
+*.csv
