@@ -407,9 +407,14 @@ def main() -> None:
 
     date_label = args.date or f"{args.start_date}_to_{args.end_date}"
 
+    export_dir = Path("exports") / args.route_id
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    date_label = args.date or f"{args.start_date}_to_{args.end_date}"
+
     output_path = Path(
         args.output
-        or f"route_{args.route_id}_{date_label}_analytics.xlsx"
+        or export_dir / f"route_{args.route_id}_{date_label}_analytics.xlsx"
     )
 
     print(f"Querying route {args.route_id} from {start} to {stop}...")
