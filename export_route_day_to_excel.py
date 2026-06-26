@@ -9,6 +9,8 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
+from openpyxl.styles import Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 
 def require_env(name: str) -> str:
     value = os.environ.get(name)
@@ -223,6 +225,10 @@ def make_stop_summary(df: pd.DataFrame) -> pd.DataFrame:
     return _aggregate_delay(df, group_cols)
 
 
+import pandas as pd
+from pathlib import Path
+import json
+
 def write_outputs(
     output_path: Path,
     raw_df: pd.DataFrame,
@@ -233,83 +239,66 @@ def write_outputs(
     operational_summary: pd.DataFrame,
     metadata: dict,
 ) -> None:
+    """
+    Writes a plain, unformatted Excel file for human review, 
+    and clean CSVs for Power BI ingestion to bypass PBI model hangs.
+    """
+    print(f"Exporting BI artifacts to {output_path.parent}...")
     
-    # 1. ALWAYS write the raw dataframe to a CSV directly
-    raw_csv_path = output_path.with_name(f"{output_path.stem}_raw.csv")
-    raw_df.to_csv(raw_csv_path, index=False)
-    
-    metadata.update({
-        "raw_csv_output": str(raw_csv_path.resolve()),
-        "raw_rows_exported": len(raw_df),
-    })
-
-    # 2. Setup the Data Dictionary for the Excel Summary File
-    data_dictionary = pd.DataFrame(
-        [
-            ["_time", "Timestamp of observation"],
-            ["route_id", "Transit route identifier"],
-            ["stop_id", "Stop identifier, if present"],
-            ["delay_seconds", "Schedule delay in seconds"],
-            ["service_date", "Date derived from _time"],
-            ["hour", "Hour of day derived from _time"],
-            ["weekday", "Weekday derived from _time"],
-            ["operational_period", "Peak AM (6-8), Peak PM (15-17), or Off-Peak"],
-            ["pct_late_5min", "Share of records more than 5 minutes late"],
-        ],
-        columns=["column", "description"],
-    )
-
-    run_metadata = pd.DataFrame(list(metadata.items()), columns=["setting", "value"])
-
-    # 3. Write ONLY the summaries to Excel (Fixes the memory/hanging bug)
-    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        daily_summary.to_excel(writer, sheet_name="Daily Summary", index=False)
-        hourly_summary.to_excel(writer, sheet_name="Hourly Summary", index=False)
-        weekday_summary.to_excel(writer, sheet_name="Weekday Summary", index=False)
-        operational_summary.to_excel(writer, sheet_name="Peak vs Off-Peak", index=False)
-        
-        if not stop_summary.empty:
+    # 1. Write the Human-Readable Excel (Plain, no formatting to avoid OpenXML errors)
+    try:
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            daily_summary.to_excel(writer, sheet_name="Daily Summary", index=False)
+            hourly_summary.to_excel(writer, sheet_name="Hourly Summary", index=False)
             stop_summary.to_excel(writer, sheet_name="Stop Summary", index=False)
-
-        data_dictionary.to_excel(writer, sheet_name="Data Dictionary", index=False)
-        run_metadata.to_excel(writer, sheet_name="Run Metadata", index=False)
-
-        workbook = writer.book
-        header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
-        percent_format = workbook.add_format({"num_format": "0.0%"})
-        seconds_format = workbook.add_format({"num_format": "0.0"})
-
-        sheets_to_format = {
-            "Daily Summary": daily_summary,
-            "Hourly Summary": hourly_summary,
-            "Weekday Summary": weekday_summary,
-            "Peak vs Off-Peak": operational_summary,
-            "Stop Summary": stop_summary,
-            "Data Dictionary": data_dictionary,
-            "Run Metadata": run_metadata,
-        }
-
-        for sheet_name, sheet_df in sheets_to_format.items():
-            if sheet_name not in writer.sheets or sheet_df.empty:
-                continue
-
-            worksheet = writer.sheets[sheet_name]
-            worksheet.freeze_panes(1, 0)
-
-            for col_idx, col_name in enumerate(sheet_df.columns):
-                worksheet.write(0, col_idx, col_name, header_format)
-                width = max(
-                    len(str(col_name)) + 2,
-                    min(28, int(sheet_df[col_name].astype(str).str.len().quantile(0.95)) + 2) if not sheet_df.empty else 12,
-                )
-                worksheet.set_column(col_idx, col_idx, width)
-
-                if str(col_name).startswith("pct_"):
-                    worksheet.set_column(col_idx, col_idx, 14, percent_format)
-                elif "delay_seconds" in str(col_name):
-                    worksheet.set_column(col_idx, col_idx, 18, seconds_format)
+            weekday_summary.to_excel(writer, sheet_name="Weekday Summary", index=False)
+            operational_summary.to_excel(writer, sheet_name="Op Summary", index=False)
             
-            worksheet.autofilter(0, 0, len(sheet_df), max(0, len(sheet_df.columns) - 1))
+            # Write metadata as a simple key-value sheet
+            meta_df = pd.DataFrame(list(metadata.items()), columns=["Metric", "Value"])
+            meta_df.to_excel(writer, sheet_name="Metadata", index=False)
+        print(f"  -> Saved unformatted Excel artifact: {output_path.name}")
+    except Exception as e:
+        print(f"  -> Warning: Excel export failed ({e}). Skipping Excel.")
+
+    # 2. Write the Machine-Readable CSVs for Power BI
+    # Create a subfolder for this specific run's CSVs to keep things tidy
+    csv_dir = output_path.parent / f"{output_path.stem}_csvs"
+    csv_dir.mkdir(exist_ok=True, parents=True)
+
+    # Dictionary of dataframes to export
+    exports = {
+        "raw_data": raw_df,
+        "daily_summary": daily_summary,
+        "hourly_summary": hourly_summary,
+        "stop_summary": stop_summary,
+        "weekday_summary": weekday_summary,
+        "operational_summary": operational_summary
+    }
+
+    for name, df in exports.items():
+        if not df.empty:
+            csv_file = csv_dir / f"{name}.csv"
+            # Create a clean copy to modify
+            df_clean = df.copy()
+            
+            # Round ONLY numeric columns to 4 decimal places to prevent PBI hanging
+            numeric_cols = df_clean.select_dtypes(include=['float64', 'float32']).columns
+            df_clean[numeric_cols] = df_clean[numeric_cols].round(4)
+            
+            # Force Windows line endings (\r\n) and export
+            df_clean.to_csv(
+                csv_file, 
+                index=False, 
+                encoding="utf-8-sig", 
+                lineterminator='\r\n'
+            )
+            
+    # Dump metadata to JSON for good measure
+    with open(csv_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4, default=str)
+
+    print(f"  -> Saved clean CSVs to: {csv_dir.name}/ (Use these for Power BI)")
 
 
 def main() -> None:
