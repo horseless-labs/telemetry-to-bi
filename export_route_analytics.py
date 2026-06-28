@@ -9,15 +9,22 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
+import json
+
+## about to be redundant?
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+
+# Google Sheets
+import gspread
+from gspread_dataframe import set_with_dataframe
+from google.oauth2.service_account import Credentials
 
 def require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
-
 
 def clean_id_column(series: pd.Series) -> pd.Series:
     return (
@@ -27,7 +34,6 @@ def clean_id_column(series: pd.Series) -> pd.Series:
         .str.replace(r"\.0$", "", regex=True)
         .replace({"<NA>": pd.NA, "nan": pd.NA, "NaN": pd.NA, "": pd.NA})
     )
-
 
 def run_influx_query(
     bucket: str,
@@ -93,7 +99,6 @@ from(bucket:"{bucket}")
         )
 
     return result.stdout
-
 
 def parse_influx_csv(csv_text: str) -> pd.DataFrame:
     if not csv_text.strip():
@@ -179,13 +184,11 @@ def _aggregate_delay(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
         .reset_index()
     )
 
-
 def make_daily_route_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "delay_seconds" not in df.columns: return pd.DataFrame()
     group_cols = ["service_date", "route_id"]
     if "record_type" in df.columns: group_cols.append("record_type")
     return _aggregate_delay(df, group_cols)
-
 
 def make_hourly_route_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "delay_seconds" not in df.columns: return pd.DataFrame()
@@ -193,7 +196,6 @@ def make_hourly_route_summary(df: pd.DataFrame) -> pd.DataFrame:
     if "record_type" in df.columns: group_cols.append("record_type")
     group_cols.append("hour")
     return _aggregate_delay(df, group_cols)
-
 
 def make_weekday_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "delay_seconds" not in df.columns or "weekday" not in df.columns:
@@ -204,13 +206,11 @@ def make_weekday_summary(df: pd.DataFrame) -> pd.DataFrame:
     summary['weekday'] = pd.Categorical(summary['weekday'], categories=cats, ordered=True)
     return summary.sort_values('weekday')
 
-
 def make_operational_period_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "delay_seconds" not in df.columns or "operational_period" not in df.columns:
         return pd.DataFrame()
     group_cols = ["service_date", "route_id", "operational_period"]
     return _aggregate_delay(df, group_cols)
-
 
 def make_stop_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "delay_seconds" not in df.columns or "stop_id" not in df.columns:
@@ -224,11 +224,7 @@ def make_stop_summary(df: pd.DataFrame) -> pd.DataFrame:
     group_cols = ["service_date", "route_id", "stop_id"]
     return _aggregate_delay(df, group_cols)
 
-
-import pandas as pd
-from pathlib import Path
-import json
-
+# .xlsx outputs
 def write_outputs(
     output_path: Path,
     raw_df: pd.DataFrame,
@@ -300,6 +296,195 @@ def write_outputs(
 
     print(f"  -> Saved clean CSVs to: {csv_dir.name}/ (Use these for Power BI)")
 
+def get_gspread_client():
+    import gspread
+
+    auth_mode = os.environ.get("GOOGLE_AUTH_MODE", "oauth").strip().lower()
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    if auth_mode == "oauth":
+        client_secret = require_env("GOOGLE_OAUTH_CLIENT_SECRET")
+        token_file = os.environ.get("GOOGLE_OAUTH_TOKEN", "token.json").strip()
+
+        return gspread.oauth(
+            scopes=scopes,
+            credentials_filename=client_secret,
+            authorized_user_filename=token_file,
+        )
+
+    if auth_mode == "service_account":
+        from google.oauth2.service_account import Credentials
+
+        credentials_path = require_env("GOOGLE_APPLICATION_CREDENTIALS")
+
+        credentials = Credentials.from_service_account_file(
+            credentials_path,
+            scopes=scopes,
+        )
+
+        return gspread.authorize(credentials)
+
+    raise RuntimeError(
+        f"Unknown GOOGLE_AUTH_MODE={auth_mode!r}. Use 'oauth' or 'service_account'."
+    )
+
+# Googel Sheets outputs
+def write_google_sheets_workbook(
+    workbook_title: str,
+    raw_df: pd.DataFrame,
+    daily_summary: pd.DataFrame,
+    hourly_summary: pd.DataFrame,
+    stop_summary: pd.DataFrame,
+    weekday_summary: pd.DataFrame,
+    operational_summary: pd.DataFrame,
+    metadata: dict,
+    share_with: str | None = None,
+) -> str:
+    """
+    Create a Google Sheets workbook and write telemetry analytics tabs.
+
+    Requires:
+        pip install gspread gspread-dataframe google-auth
+
+    Auth:
+        export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+
+    Returns:
+        Google Sheets URL.
+    """
+
+    credentials_path = require_env("GOOGLE_APPLICATION_CREDENTIALS")
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    client = get_gspread_client()
+    spreadsheet = client.create(workbook_title)
+
+    drive_folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+
+    if drive_folder_id:
+        spreadsheet = client.create(
+            workbook_title,
+            folder_id=drive_folder_id,
+        )
+    else:
+        spreadsheet = client.create(workbook_title)
+
+    def sanitize_for_sheets(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Make dataframe values friendlier for Google Sheets.
+        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        cleaned = df.copy()
+
+        for col in cleaned.columns:
+            if pd.api.types.is_datetime64_any_dtype(cleaned[col]):
+                cleaned[col] = cleaned[col].astype(str)
+
+        # Convert Python date objects, nullable values, and NaN/NaT safely.
+        cleaned = cleaned.astype(object)
+        cleaned = cleaned.where(pd.notna(cleaned), "")
+
+        return cleaned
+
+    def write_tab(sheet_name: str, df: pd.DataFrame) -> None:
+        df = sanitize_for_sheets(df)
+
+        # Google Sheets tab names max out at 100 chars.
+        sheet_name_clean = sheet_name[:100]
+
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name_clean)
+            worksheet.clear()
+        except gspread.WorksheetNotFound:
+            rows = max(len(df) + 10, 100)
+            cols = max(len(df.columns) + 5, 20)
+            worksheet = spreadsheet.add_worksheet(
+                title=sheet_name_clean,
+                rows=rows,
+                cols=cols,
+            )
+
+        if df.empty:
+            worksheet.update("A1", [["No data returned for this summary."]])
+            return
+
+        set_with_dataframe(
+            worksheet,
+            df,
+            include_index=False,
+            include_column_header=True,
+            resize=True,
+        )
+
+        # Freeze header row.
+        worksheet.freeze(rows=1)
+
+        # Bold header row and give it a light fill.
+        worksheet.format(
+            "1:1",
+            {
+                "textFormat": {"bold": True},
+                "backgroundColor": {
+                    "red": 0.90,
+                    "green": 0.90,
+                    "blue": 0.90,
+                },
+            },
+        )
+
+        # Basic filter over the populated range.
+        worksheet.set_basic_filter()
+
+    metadata_df = pd.DataFrame(
+        [{"metric": key, "value": str(value)} for key, value in metadata.items()]
+    )
+
+    tabs = [
+        ("Metadata", metadata_df),
+        ("Daily Summary", daily_summary),
+        ("Hourly Summary", hourly_summary),
+        ("Stop Summary", stop_summary),
+        ("Weekday Summary", weekday_summary),
+        ("Operational Summary", operational_summary),
+        ("Raw Data", raw_df),
+    ]
+
+    # Reuse the default first sheet for Metadata instead of leaving Sheet1 around.
+    first_worksheet = spreadsheet.sheet1
+    first_worksheet.update_title("Metadata")
+
+    for sheet_name, df in tabs:
+        write_tab(sheet_name, df)
+
+    # Move Raw Data to the end visually.
+    try:
+        raw_sheet = spreadsheet.worksheet("Raw Data")
+        spreadsheet.reorder_worksheets(
+            [
+                spreadsheet.worksheet("Metadata"),
+                spreadsheet.worksheet("Daily Summary"),
+                spreadsheet.worksheet("Hourly Summary"),
+                spreadsheet.worksheet("Stop Summary"),
+                spreadsheet.worksheet("Weekday Summary"),
+                spreadsheet.worksheet("Operational Summary"),
+                raw_sheet,
+            ]
+        )
+    except Exception:
+        # Not fatal. The workbook is still usable.
+        pass
+
+    return spreadsheet.url
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export transit analytics pipeline.")
@@ -308,6 +493,17 @@ def main() -> None:
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--google-sheet",
+        action="store_true",
+        help="Create a Google Sheets workbook instead of local Excel/CSV outputs.",
+    )
+
+    parser.add_argument(
+        "--share-with",
+        default=None,
+        help="Optional Google account email to share the created workbook with.",
+    )
 
     args = parser.parse_args()
 
@@ -362,22 +558,48 @@ def main() -> None:
         }
 
         pbar.set_postfix_str("Writing CSV and Excel files to disk...")
-        write_outputs(
-            output_path=output_path,
-            raw_df=raw_df,
-            daily_summary=daily_summary,
-            hourly_summary=hourly_summary,
-            stop_summary=stop_summary,
-            weekday_summary=weekday_summary,
-            operational_summary=operational_summary,
-            metadata=metadata,
-        )
+
+        if args.google_sheet:
+            workbook_title = f"Telemetry to BI - Route {args.route_id} - {date_label}"
+
+            metadata["artifact_type"] = "google_sheets_workbook"
+
+            sheet_url = write_google_sheets_workbook(
+                workbook_title=workbook_title,
+                raw_df=raw_df,
+                daily_summary=daily_summary,
+                hourly_summary=hourly_summary,
+                stop_summary=stop_summary,
+                weekday_summary=weekday_summary,
+                operational_summary=operational_summary,
+                metadata=metadata,
+                share_with=args.share_with,
+            )
+
+            metadata["google_sheet_url"] = sheet_url
+            print(f"  -> Created Google Sheets workbook: {sheet_url}")
+        else:
+            # Excel outputs
+            write_outputs(
+                output_path=output_path,
+                raw_df=raw_df,
+                daily_summary=daily_summary,
+                hourly_summary=hourly_summary,
+                stop_summary=stop_summary,
+                weekday_summary=weekday_summary,
+                operational_summary=operational_summary,
+                metadata=metadata,
+            )
         pbar.update(2) # Finish out the bar
 
     print(f"\n--- Export Complete ---")
     print(f"Total Rows: {len(raw_df):,}")
-    print(f"Raw CSV location: {output_path.with_name(f'{output_path.stem}_raw.csv').resolve()}")
-    print(f"Summary Excel location: {output_path.resolve()}")
+
+    if args.google_sheet:
+        print("Output: Google Sheets workbook")
+    else:
+        print(f"Summary Excel location: {output_path.resolve()}")
+        print(f"CSV folder: {(output_path.parent / f'{output_path.stem}_csvs').resolve()}")
 
 if __name__ == "__main__":
     main()
