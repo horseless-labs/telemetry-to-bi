@@ -113,3 +113,6 @@ This represents a strong portfolio example of practical office automation and op
 This architecture reflects a common business automation pattern: transforming messy operational data into a clean, shareable reporting artifact that can be regenerated on demand.
 
 # 2026-07-02
+This update refactors Telemetry to BI from a single working script into a more maintainable extract-transform-publish pipeline. The Python code is being split into focused modules for querying InfluxDB, cleaning telemetry data, generating route summaries, and publishing outputs to either local Excel/CSV artifacts or Google Sheets. The goal is to make the project easier to understand, extend, and present as a reusable office automation/analytics workflow.
+
+The Google Sheets publisher now creates a shareable workbook with summary tabs for daily, hourly, stop-level, weekday, and operational-period analysis. To keep the workbook reliable at larger data volumes, the full raw telemetry export stays in local CSV artifacts while Sheets receives a capped raw sample and the analysis summaries. This keeps Google Sheets focused on reviewable business-facing outputs instead of trying to act as the full data warehouse.
