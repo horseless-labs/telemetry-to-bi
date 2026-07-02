@@ -1,6 +1,5 @@
 # Telemetry to BI
-
-Telemetry to BI is a Python automation pipeline that turns raw transit telemetry from InfluxDB into clean, reviewable business intelligence outputs.
+Telemetry to BI is a Python ETL-style automation pipeline that transforms raw transit telemetry from InfluxDB into clean, reviewable business intelligence outputs.
 
 The project extracts route-level telemetry data, cleans and reshapes it with pandas, generates summary tables, and publishes the results as either local Excel/CSV artifacts or a shareable Google Sheets workbook. The goal is to demonstrate a practical office automation pattern: raw operational data in, organized reporting workbook out.
 
@@ -35,7 +34,7 @@ Raw telemetry database
 
 Instead of manually querying data, cleaning files, and rebuilding spreadsheets, the workflow can be run from the command line and produce a consistent reporting workbook.
 
-## Example outputs
+## Example Outputs
 
 The pipeline can generate summaries such as:
 
@@ -49,7 +48,7 @@ The pipeline can generate summaries such as:
 
 Google Sheets output is designed to be business-facing. Full raw data is kept in local CSV exports, while Google Sheets receives summary tabs and a capped raw sample to avoid workbook size limits.
 
-## Project structure
+## Project Structure
 
 ```text
 .
@@ -77,7 +76,7 @@ Google Sheets output is designed to be business-facing. Full raw data is kept in
 └── requirements.txt
 ```
 
-## Module overview
+## Module Overview
 
 ```text
 extract.py         InfluxDB query logic
@@ -89,7 +88,7 @@ pipeline.py        End-to-end pipeline orchestration
 cli.py             Command-line interface
 ```
 
-## Current pipeline
+## ETL Workflow
 
 ```text
 InfluxDB
@@ -116,7 +115,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-## Environment setup
+## Environment Setup
 
 Create a `.env` file based on `.env.example`.
 
@@ -226,7 +225,7 @@ stop_with_position
 unknown
 ```
 
-## Summary metrics
+## Summary Metrics
 
 The summary tables include metrics such as:
 
@@ -239,7 +238,21 @@ The summary tables include metrics such as:
 * Percent more than 5 minutes late
 * Percent more than 10 minutes late
 
-## Business use cases
+## Technologies and concepts demonstrated
+
+* Python
+* pandas
+* ETL pipeline design
+* Data cleaning and transformation
+* Google Sheets API
+* OAuth authentication
+* InfluxDB querying
+* Reporting automation
+* CLI application design
+* Excel and CSV report generation
+* Business intelligence workflows
+
+## Business Use Cases
 
 This pattern can be adapted for:
 
