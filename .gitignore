@@ -1,6 +1,7 @@
 wimbac-influx-copy/
+src/telemetry_to_bi/__pycache__/
 *.sw*
-__pycache__/*
+*__pycache__/*
 influx_token.txt
 *.txt
 !requirements.txt

@@ -4,5 +4,7 @@
     "route_id": "40",
     "start": "2026-05-01T00:00:00Z",
     "stop": "2026-05-16T00:00:00Z",
+    "num_raw_rows": 437366,
+    "artifact_type": "local_excel_csv",
     "summary_excel_output": "/home/mireles/horseless/telemetry_to_bi/exports/40/route_40_2026-05-01_to_2026-05-15_analytics.xlsx"
 }
