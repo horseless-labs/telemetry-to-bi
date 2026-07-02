@@ -2,11 +2,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from .extract import run_influx_query
-from .publish_files import write_local_artifacts
-from .publish_sheets import write_google_sheets_workbook
-from .summarize import build_summaries
-from .transform import parse_influx_csv
+from telemetry_to_bi.extract import run_influx_query
+from telemetry_to_bi.publish_files import write_local_artifacts
+from telemetry_to_bi.publish_sheets import write_google_sheets_workbook
+from telemetry_to_bi.summarize import build_summaries
+from telemetry_to_bi.transform import parse_influx_csv
 
 
 def run_pipeline(
