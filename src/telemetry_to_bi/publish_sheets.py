@@ -1,8 +1,11 @@
 """
 Google Sheets publishing utilities for Telemetry to BI.
 
-This module creates a Google Sheets workbook and writes telemetry analytics
-DataFrames into separate tabs.
+Creates a Google Sheets workbook and writes telemetry analytics tabs.
+
+Important:
+    Google Sheets has a workbook cell limit, so this module does NOT publish
+    the full raw dataset. It publishes summary tabs plus a capped Raw Sample tab.
 
 Supported auth modes:
 
@@ -22,11 +25,6 @@ Supported auth modes:
 
    Optional env:
        GOOGLE_DRIVE_FOLDER_ID=<folder id>
-
-Notes:
-    - OAuth is best when you want the workbook created in your personal Drive.
-    - Service account auth is best for server-side automation, but the service
-      account must have access to the target Drive folder.
 """
 
 from __future__ import annotations
@@ -44,6 +42,8 @@ SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+RAW_SAMPLE_ROWS = 1000
 
 
 def require_env(name: str) -> str:
@@ -159,6 +159,8 @@ def get_or_create_worksheet(
 ) -> gspread.Worksheet:
     """
     Return an existing worksheet or create it if missing.
+
+    Sizing is intentionally tight to avoid wasting Google Sheets workbook cells.
     """
     sheet_name_clean = sheet_name[:100]
 
@@ -168,8 +170,8 @@ def get_or_create_worksheet(
         return worksheet
 
     except gspread.WorksheetNotFound:
-        rows = max(len(df) + 10, 100)
-        cols = max(len(df.columns) + 5, 20)
+        rows = max(len(df) + 1, 10)
+        cols = max(len(df.columns), 5)
 
         return spreadsheet.add_worksheet(
             title=sheet_name_clean,
@@ -188,24 +190,29 @@ def format_worksheet(worksheet: gspread.Worksheet) -> None:
         - light gray header background
         - basic filter
     """
-    worksheet.freeze(rows=1)
+    try:
+        worksheet.freeze(rows=1)
+    except Exception:
+        pass
 
-    worksheet.format(
-        "1:1",
-        {
-            "textFormat": {"bold": True},
-            "backgroundColor": {
-                "red": 0.90,
-                "green": 0.90,
-                "blue": 0.90,
+    try:
+        worksheet.format(
+            "1:1",
+            {
+                "textFormat": {"bold": True},
+                "backgroundColor": {
+                    "red": 0.90,
+                    "green": 0.90,
+                    "blue": 0.90,
+                },
             },
-        },
-    )
+        )
+    except Exception:
+        pass
 
     try:
         worksheet.set_basic_filter()
     except Exception:
-        # Formatting failure should not break publishing.
         pass
 
 
@@ -250,10 +257,10 @@ def reorder_tabs(
     This is nice-to-have only. If it fails, the workbook is still usable.
     """
     try:
-        worksheets = []
-
-        for name in ordered_tab_names:
-            worksheets.append(spreadsheet.worksheet(name[:100]))
+        worksheets = [
+            spreadsheet.worksheet(name[:100])
+            for name in ordered_tab_names
+        ]
 
         spreadsheet.reorder_worksheets(worksheets)
 
@@ -278,6 +285,19 @@ def share_spreadsheet(
         perm_type="user",
         role="writer",
     )
+
+
+def make_raw_sample(raw_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Return a capped raw sample for Google Sheets.
+
+    Full raw data should stay in CSV/local artifacts because Google Sheets has
+    workbook cell limits.
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+
+    return raw_df.head(RAW_SAMPLE_ROWS).copy()
 
 
 def write_google_sheets_workbook(
@@ -314,13 +334,20 @@ def write_google_sheets_workbook(
     Returns:
         The Google Sheets URL.
     """
-    client = get_gspread_client()
-    spreadsheet = create_spreadsheet(
-        client=client,
-        workbook_title=workbook_title,
+    metadata = dict(metadata)
+
+    raw_row_count = len(raw_df) if raw_df is not None else 0
+    raw_sample_row_count = min(raw_row_count, RAW_SAMPLE_ROWS)
+
+    metadata["raw_data_note"] = (
+        "Full raw data is not written to Google Sheets. "
+        "Use the local CSV export for complete raw data."
     )
+    metadata["raw_rows_total"] = raw_row_count
+    metadata["raw_sample_rows_in_sheet"] = raw_sample_row_count
 
     metadata_df = make_metadata_dataframe(metadata)
+    raw_sample = make_raw_sample(raw_df)
 
     tabs = [
         ("Metadata", metadata_df),
@@ -329,8 +356,14 @@ def write_google_sheets_workbook(
         ("Stop Summary", summaries.get("stop_summary", pd.DataFrame())),
         ("Weekday Summary", summaries.get("weekday_summary", pd.DataFrame())),
         ("Operational Summary", summaries.get("operational_summary", pd.DataFrame())),
-        ("Raw Data", raw_df),
+        ("Raw Sample", raw_sample),
     ]
+
+    client = get_gspread_client()
+    spreadsheet = create_spreadsheet(
+        client=client,
+        workbook_title=workbook_title,
+    )
 
     # Reuse the default first worksheet instead of leaving "Sheet1" around.
     try:
