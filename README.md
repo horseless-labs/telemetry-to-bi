@@ -1,0 +1,257 @@
+# Telemetry to BI
+
+Telemetry to BI is a Python automation pipeline that turns raw transit telemetry from InfluxDB into clean, reviewable business intelligence outputs.
+
+The project extracts route-level telemetry data, cleans and reshapes it with pandas, generates summary tables, and publishes the results as either local Excel/CSV artifacts or a shareable Google Sheets workbook. The goal is to demonstrate a practical office automation pattern: raw operational data in, organized reporting workbook out.
+
+## What this project does
+
+This pipeline automates the process of turning route telemetry into analysis-ready reports.
+
+It currently supports:
+
+* Querying InfluxDB for route telemetry over a selected date range
+* Cleaning raw CSV output from the Influx CLI
+* Normalizing IDs, timestamps, route fields, stop fields, and vehicle fields
+* Creating useful derived fields such as service date, hour, weekday, operational period, and record type
+* Generating route summaries with pandas
+* Exporting local Excel and CSV artifacts
+* Publishing a formatted Google Sheets workbook to Google Drive
+* Supporting OAuth-based Google Drive publishing for personal Drive workflows
+
+## Why this matters
+
+A common problem in operations, logistics, manufacturing, and small business reporting is that useful data exists somewhere, but it is not in a form that managers or analysts can easily review.
+
+This project is a reusable example of how to bridge that gap.
+
+```text
+Raw telemetry database
+→ Python extraction script
+→ pandas cleaning and summarization
+→ Excel/CSV artifacts or Google Sheets workbook
+→ reviewable business report
+```
+
+Instead of manually querying data, cleaning files, and rebuilding spreadsheets, the workflow can be run from the command line and produce a consistent reporting workbook.
+
+## Example outputs
+
+The pipeline can generate summaries such as:
+
+* Daily route performance
+* Hourly route performance
+* Stop-level delay summaries
+* Weekday vs. weekend patterns
+* Peak vs. off-peak performance
+* Raw telemetry sample for review
+* Metadata about the export run
+
+Google Sheets output is designed to be business-facing. Full raw data is kept in local CSV exports, while Google Sheets receives summary tabs and a capped raw sample to avoid workbook size limits.
+
+## Project structure
+
+```text
+.
+├── config/
+│   └── config.example.yaml
+├── docs/
+│   └── screenshots/
+├── exports/
+├── scripts/
+│   ├── export_influx_line_protocol.sh
+│   ├── load_influx_env.sh
+│   └── view_schema.sh
+├── src/
+│   └── telemetry_to_bi/
+│       ├── cli.py
+│       ├── extract.py
+│       ├── transform.py
+│       ├── summarize.py
+│       ├── publish_files.py
+│       ├── publish_sheets.py
+│       └── pipeline.py
+├── .env.example
+├── .gitignore
+├── README.md
+└── requirements.txt
+```
+
+## Module overview
+
+```text
+extract.py         InfluxDB query logic
+transform.py       CSV parsing, cleanup, timestamps, record classification
+summarize.py       pandas summary tables
+publish_files.py   Local Excel and CSV export
+publish_sheets.py  Google Sheets publishing
+pipeline.py        End-to-end pipeline orchestration
+cli.py             Command-line interface
+```
+
+## Current pipeline
+
+```text
+InfluxDB
+→ Influx CLI query
+→ raw CSV response
+→ pandas DataFrame
+→ cleaned telemetry table
+→ summary DataFrames
+→ Excel/CSV or Google Sheets
+```
+
+## Installation
+
+Create and activate a virtual environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Environment setup
+
+Create a `.env` file based on `.env.example`.
+
+Example:
+
+```bash
+INFLUX_BUCKET=wimbac
+INFLUX_ORG=your-org
+INFLUX_TOKEN=your-token
+
+GOOGLE_AUTH_MODE=oauth
+GOOGLE_OAUTH_CLIENT_SECRET=local/secrets/client_secret.json
+GOOGLE_OAUTH_TOKEN=local/secrets/token.json
+GOOGLE_DRIVE_FOLDER_ID=your-google-drive-folder-id
+```
+
+Local secrets, OAuth tokens, copied databases, and generated exports should not be committed to version control.
+
+## Running the local Excel/CSV export
+
+From the project root:
+
+```bash
+PYTHONPATH=src python -m telemetry_to_bi.cli \
+  --route-id 11 \
+  --start-date 2026-05-01 \
+  --end-date 2026-05-15
+```
+
+This creates local artifacts under `exports/`.
+
+Typical outputs include:
+
+```text
+exports/
+└── 11/
+    ├── route_11_2026-05-01_to_2026-05-15_analytics.xlsx
+    └── route_11_2026-05-01_to_2026-05-15_analytics_csvs/
+        ├── raw_data.csv
+        ├── daily_summary.csv
+        ├── hourly_summary.csv
+        ├── stop_summary.csv
+        ├── weekday_summary.csv
+        ├── operational_summary.csv
+        └── metadata.json
+```
+
+## Publishing to Google Sheets
+
+To publish a workbook to Google Sheets:
+
+```bash
+PYTHONPATH=src python -m telemetry_to_bi.cli \
+  --route-id 11 \
+  --start-date 2026-05-01 \
+  --end-date 2026-05-15 \
+  --google-sheet
+```
+
+To share the created workbook with another Google account:
+
+```bash
+PYTHONPATH=src python -m telemetry_to_bi.cli \
+  --route-id 11 \
+  --start-date 2026-05-01 \
+  --end-date 2026-05-15 \
+  --google-sheet \
+  --share-with someone@example.com
+```
+
+## Google Sheets workbook layout
+
+The published workbook includes tabs such as:
+
+```text
+Metadata
+Daily Summary
+Hourly Summary
+Stop Summary
+Weekday Summary
+Operational Summary
+Raw Sample
+```
+
+The full raw dataset is intentionally not written to Google Sheets. Large telemetry exports can exceed Google Sheets workbook limits, so complete raw data remains available in local CSV artifacts.
+
+## Data cleaning and derived fields
+
+The transform step handles:
+
+* Influx CSV cleanup
+* Timestamp parsing
+* Numeric conversion for delay and coordinates
+* ID normalization for route, stop, trip, and vehicle fields
+* Service date extraction
+* Hour and weekday extraction
+* Peak and off-peak classification
+* Suspicious coordinate flags
+* Record type classification
+
+Record types include:
+
+```text
+vehicle_position
+stop_prediction
+stop_with_position
+unknown
+```
+
+## Summary metrics
+
+The summary tables include metrics such as:
+
+* Number of data points
+* Average delay
+* Median delay
+* 90th percentile delay
+* Maximum delay
+* Percent on time
+* Percent more than 5 minutes late
+* Percent more than 10 minutes late
+
+## Business use cases
+
+This pattern can be adapted for:
+
+* Transit or logistics reporting
+* Operations dashboards
+* Google Sheets automation
+* Recurring KPI reports
+* Database-to-spreadsheet workflows
+* Small business reporting
+* Internal analytics prototypes
+* Replacing manual spreadsheet rebuilds
+
+## Notes
+
+This project was built from a real telemetry dataset and refactored from an initial single-script prototype into a more maintainable package structure. The current version is intended as a practical automation portfolio project and a foundation for future reporting workflows.
